@@ -16,6 +16,7 @@ HOST = "0.0.0.0"
 PORT = 8765
 MODEL_SIZE = "base"
 AUDIO_FORMAT = (1, 2, 16000, 16000, 'NONE', 'NONE')  # 16-bit 16kHz mono WAV
+FFMPEG_PATH = "/opt/homebrew/bin/ffmpeg"  # Homebrew path on Apple Silicon
 
 # Find project root (works regardless of working directory)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -70,7 +71,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
         # Convert to 16kHz mono 16-bit PCM WAV using ffmpeg
         import subprocess
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(input_path),
+            [FFMPEG_PATH, "-y", "-i", str(input_path),
              "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
              str(wav_path)],
             capture_output=True, timeout=30,
@@ -117,15 +118,16 @@ def client_js():
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     """Receive audio, transcribe, paste, return result."""
-    if "audio" not in flask.request.files:
-        return {"error": "No audio file"}, 400
-
-    audio_file = flask.request.files["audio"]
-    audio_data = audio_file.read()
-    filename = audio_file.filename or "audio.webm"
+    # Accept both raw body and multipart upload
+    audio_data = flask.request.get_data()
+    filename = "audio.webm"
+    if not audio_data and "audio" in flask.request.files:
+        audio_file = flask.request.files["audio"]
+        audio_data = audio_file.read()
+        filename = audio_file.filename or "audio.webm"
 
     if len(audio_data) < 100:
-        return {"text": "", "error": "Audio too small"}
+        return {"text": "", "error": "Audio too small"}, 400
 
     try:
         text = transcribe_audio(audio_data, filename)
@@ -149,6 +151,22 @@ def status():
         "model_loaded": _model is not None,
         "model": MODEL_SIZE,
     }
+
+@app.route("/log-error", methods=["POST"])
+def log_error():
+    data = flask.request.get_json(silent=True) or {}
+    print(f"🐛 CLIENT ERROR: {data.get('where')}: {data.get('message')}", flush=True)
+    print(f"   User-Agent: {data.get('userAgent', 'unknown')}", flush=True)
+    return {"ok": True}
+
+@app.route("/cert.pem")
+def download_cert():
+    """Serve the SSL cert so the user can install it on remote machines."""
+    cert_dir = Path.home() / ".dictate-ssl"
+    cert_file = cert_dir / "cert.pem"
+    if cert_file.exists():
+        return flask.send_file(str(cert_file), mimetype="application/x-pem-file", as_attachment=True, download_name="dictate-cert.pem")
+    return {"error": "No cert found"}, 404
 
 # ─── HTML page (embedded template) ──────────────────────────────────
 HTML_PAGE_STR = ""
@@ -196,7 +214,12 @@ def generate_self_signed_cert(cert_dir: Path):
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
         .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost"), x509.IPAddress(ipaddress.IPv4Address("10.0.0.164"))]), critical=False)
+        .add_extension(x509.SubjectAlternativeName([
+            x509.DNSName("localhost"),
+            x509.IPAddress(ipaddress.IPv4Address("10.0.0.164")),
+            x509.IPAddress(ipaddress.IPv4Address("10.0.0.225")),
+            x509.IPAddress(ipaddress.IPv4Address("100.100.235.34")),
+        ]), critical=False)
         .sign(key, hashes.SHA256(), backend=default_backend())
     )
     with open(cert_file, "wb") as f:
